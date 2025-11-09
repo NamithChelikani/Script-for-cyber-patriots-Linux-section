@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# CyberPatriot Linux Mint Hardener + Interactive User Review + Auto‐create from README
+# Run as root: sudo bash cp_mint_hardener_with_autocreate.sh
+# Logs to: /var/log/cp_mint_hardener.log
+
+set -euo pipefail
+IFS=$'\n\t'
+
+LOG="/var/log/cp_mint_hardener.log"
+ARCHIVE_DIR="/root/removed_user_archives"
+SUDO_GROUP="sudo"
+FORCE_PASS_CHANGE=true
+PASS_MIN_DAYS=1
+REMOVE_MP3=true
+MP3_PATHS=("/srv" "/home" "/media" "/var/www" "/opt" "/tmp")
+PROHIBITED_SOFTWARE=("aisleriot" "ophcrack")
+APT_UPGRADE_PACKAGES=("openssh-server" "chromium-browser" "chromium")
+
+mkdir -p "$ARCHIVE_DIR"
+exec > >(tee -a "$LOG") 2>&1
+
+info(){ echo "[INFO] $*"; }
+warn(){ echo "[WARN] $*"; }
+
+if [[ $EUID -ne 0 ]]; then
+  echo "❌ Please run as root (sudo bash …)"
+  exit 1
+fi
+
+info "=== CyberPatriot Linux Mint Hardener Starting ==="
+
+# --------------------------------------------------------------------
+# Step 0: Read README and attempt to extract “create user” hints
+# --------------------------------------------------------------------
+README_PATHS=("/home/*/Desktop/README.txt" "/home/*/README.txt" "/README.txt")
+REQUIRED_USERS=()
+
+for rp in "${README_PATHS[@]}"; do
+  for f in $(ls $rp 2>/dev/null); do
+    info "Found README file: $f"
+    # Look for lines like "Create user mross", "user account mross must change password at next login", etc
+    users_here=$(grep -Eoi 'user (?:account )?([a-z][a-z0-9]*)' "$f" | sed -E 's/user (?:account )?//i' | sort -u)
+    for u in $users_here; do
+      REQUIRED_USERS+=("$u")
+    done
+    break 2
+  done
+done
+
+if [[ ${#REQUIRED_USERS[@]} -gt 0 ]]; then
+  info "Users requiring creation (from README): ${REQUIRED_USERS[*]}"
+  for u in "${REQUIRED_USERS[@]}"; do
+    if id -u "$u" >/dev/null 2>&1; then
+      info "User $u already exists"
+    else
+      info "Creating missing user $u"
+      adduser --gecos "" "$u"
+      if [[ "$FORCE_PASS_CHANGE" = true ]]; then
+        chage -d 0 "$u"
+        info "Password change forced for $u"
+      fi
+    fi
+  done
+else
+  info "No “create user” hints found in README"
+fi
+
+# --------------------------------------------------------------------
+# Step 1: Interactive User Manager
+# --------------------------------------------------------------------
+info "=== STEP 1: Interactive User Review ==="
+SYS_USERS=($(awk -F: '$3>=1000 && $3<65534 {print $1}' /etc/passwd))
+
+if [[ ${#SYS_USERS[@]} -eq 0 ]]; then
+  info "No human users detected (UID ≥1000)."
+else
+  echo
+  echo "Detected normal users:"
+  printf '  %s\n' "${SYS_USERS[@]}"
+  echo
+  read -rp "Press Enter to review users interactively..."
+
+  for u in "${SYS_USERS[@]}"; do
+    echo
+    echo "----------------------------------------"
+    echo "User: $u"
+    groups "$u" | awk -F: '{print "Current groups:"$2}'
+    echo "Home directory: $(getent passwd "$u" | cut -d: -f6)"
+    echo "----------------------------------------"
+    echo
+
+    read -rp "Delete this user? [y/N]: " del_ans
+    del_ans=${del_ans,,}
+    if [[ "$del_ans" == "y" ]]; then
+      HOMEDIR=$(getent passwd "$u" | cut -d: -f6)
+      TS=$(date +%Y%m%d_%H%M%S)
+      if [[ -d "$HOMEDIR" ]]; then
+        ARCHIVE="$ARCHIVE_DIR/${u}_home_${TS}.tar.gz"
+        info "Archiving home directory $HOMEDIR -> $ARCHIVE"
+        tar czf "$ARCHIVE" -C "$(dirname "$HOMEDIR")" "$(basename "$HOMEDIR")" 2>/dev/null || warn "Archive failed"
+      fi
+      userdel -r "$u" 2>/dev/null || warn "User deletion finished with warnings"
+      info "❌ User $u deleted"
+      continue
+    fi
+
+    read -rp "Should this user be an administrator (sudo)? [y/N]: " admin_ans
+    admin_ans=${admin_ans,,}
+    if [[ "$admin_ans" == "y" ]]; then
+      if id -nG "$u" | grep -qw "$SUDO_GROUP"; then
+        info "$u already admin."
+      else
+        usermod -aG "$SUDO_GROUP" "$u"
+        info "✅ $u promoted to admin."
+      fi
+    else
+      if id -nG "$u" | grep -qw "$SUDO_GROUP"; then
+        gpasswd -d "$u" "$SUDO_GROUP" >/dev/null 2>&1 || true
+        info "🧍 $u demoted to standard user."
+      else
+        info "$u already standard user."
+      fi
+    fi
+
+    if [[ "$FORCE_PASS_CHANGE" == "true" ]]; then
+      read -rp "Force password change for $u at next login? [Y/n]: " pw_ans
+      pw_ans=${pw_ans,,}
+      if [[ -z "$pw_ans" || "$pw_ans" == "y" ]]; then
+        chage -d 0 "$u"
+        info "Password change forced for $u"
+      fi
+    fi
+  done
+fi
+
+# --------------------------------------------------------------------
+# Step 2: System Updates and Hardening
+# --------------------------------------------------------------------
+info "=== STEP 2: System Updates and Hardening ==="
+apt update -y
+apt install -y ufw fail2ban unattended-upgrades apt-listchanges libpam-pwquality
+
+info "Setting default minimum password age"
+if grep -qE "^PASS_MIN_DAYS" /etc/login.defs; then
+  sed -ri "s/^PASS_MIN_DAYS.*/PASS_MIN_DAYS\t$PASS_MIN_DAYS/" /etc/login.defs
+else
+  echo "PASS_MIN_DAYS $PASS_MIN_DAYS" >> /etc/login.defs
+fi
+
+info "Configuring UFW firewall"
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow OpenSSH
+ufw --force enable
+
+if dpkg -l | grep -qw apache2; then
+  info "Removing Apache2 web service"
+  systemctl stop apache2 || true
+  systemctl disable apache2 || true
+  apt purge -y apache2* || true
+  apt autoremove -y
+else
+  info "Apache2 not installed"
+fi
+
+info "Configuring unattended security updates"
+dpkg-reconfigure -fnoninteractive unattended-upgrades || true
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+
+info "Updating OpenSSH and Chromium"
+apt install --only-upgrade -y "${APT_UPGRADE_PACKAGES[@]}" || warn "Some package upgrades failed"
+
+for p in "${PROHIBITED_SOFTWARE[@]}"; do
+  if dpkg -l | grep -qw "$p"; then
+    info "Removing prohibited package: $p"
+    apt purge -y "$p" || warn "Failed to remove $p"
+  fi
+done
+
+MP3_LIST="/root/removed_mp3_$(date +%s).txt"
+> "$MP3_LIST"
+info "Scanning for prohibited MP3 files..."
+for d in "${MP3_PATHS[@]}"; do
+  [[ -d "$d" ]] || continue
+  find "$d" -type f -iname "*.mp3" >> "$MP3_LIST" 2>/dev/null || true
+done
+if [[ -s "$MP3_LIST" ]]; then
+  head -n10 "$MP3_LIST" | sed 's/^/  Found: /'
+  if [[ "$REMOVE_MP3" == "true" ]]; then
+    info "Removing all detected MP3 files..."
+    xargs rm -f < "$MP3_LIST" || warn "Some files could not be removed"
+  else
+    warn "MP3 removal disabled; see list: $MP3_LIST"
+  fi
+else
+  info "No MP3 files found."
+fi
+
+SSHD="/etc/ssh/sshd_config"
+if [[ -f "$SSHD" ]]; then
+  cp -a "$SSHD" "${SSHD}.bak.$(date +%s)"
+  if grep -qE "^[#[:space:]]*PermitRootLogin" "$SSHD"; then
+    sed -ri 's@^[#[:space:]]*PermitRootLogin.*@PermitRootLogin no@' "$SSHD"
+  else
+    echo "PermitRootLogin no" >> "$SSHD"
+  fi
+  systemctl restart ssh || systemctl restart sshd || true
+  info "SSH root login disabled"
+fi
+
+apt autoremove -y
+apt autoclean -y
+
+echo
+echo "======================================"
+echo " CyberPatriot Hardening Complete!"
+echo "======================================"
+echo
+echo "✅ Logs saved to: $LOG"
+echo "✅ Archived deleted homes: $ARCHIVE_DIR"
+echo "✅ Review sudo group: grep '^sudo:' /etc/group"
+echo "✅ Verify SSH: sudo systemctl status ssh"
+echo
+echo "Run 'sudo ufw status verbose' to confirm firewall."
+echo "Run 'sudo unattended-upgrade --dry-run' to test updates."
+echo
