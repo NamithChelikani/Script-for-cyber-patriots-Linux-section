@@ -117,6 +117,9 @@ update_system() {
 #################################################################
 # 2. USER MANAGEMENT
 #################################################################
+#################################################################
+# 2. USER MANAGEMENT
+#################################################################
 user_management() {
     clear
     echo -e "${GREEN}=== User Management ===${NC}"
@@ -125,50 +128,91 @@ user_management() {
     echo "Current users (UID >= 1000):"
     awk -F: '$3 >= 1000 && $1 != "nobody" {print $1 " (UID: " $3 ")"}' /etc/passwd
     echo ""
-    
-    if ask_yes_no "Review and remove users?"; then
-        while true; do
-            read -p "Enter username to remove (or 'done' to finish): " username
-            if [ "$username" = "done" ]; then
-                break
-            fi
-            
-            if id "$username" &>/dev/null; then
-                echo "User $username exists"
-                if ask_yes_no "Remove $username and their home directory?"; then
-                    deluser --remove-home "$username" 2>&1 | tee -a "$LOG_FILE"
-                    log_action "Removed user: $username"
-                fi
-            else
-                echo "User $username does not exist"
-            fi
-        done
-    fi
-    
+
+    echo -e "${BLUE}1) Remove Users${NC}"
+    echo -e "${BLUE}2) Manage Administrators (sudo){NC}"
+    echo -e "${BLUE}3) Return to Main Menu${NC}"
     echo ""
-    echo "Current sudo users:"
-    grep -Po '^sudo.+:\K.*$' /etc/group
-    echo ""
-    
-    if ask_yes_no "Review sudo privileges?"; then
-        while true; do
-            read -p "Enter username to remove from sudo (or 'done' to finish): " username
-            if [ "$username" = "done" ]; then
-                break
+
+    read -p "Select an option: " um_choice
+
+    case $um_choice in
+        1)
+            ###########################################################
+            # REMOVE USERS
+            ###########################################################
+            if ask_yes_no "Review and remove users?"; then
+                while true; do
+                    read -p "Enter username to remove (or 'done' to finish): " username
+                    if [ "$username" = "done" ]; then break; fi
+                
+                    if id "$username" &>/dev/null; then
+                        echo "User $username exists"
+                        if ask_yes_no "Remove $username and their home directory?"; then
+                            deluser --remove-home "$username" 2>&1 | tee -a "$LOG_FILE"
+                            log_action "Removed user: $username"
+                        fi
+                    else
+                        echo "User $username does not exist"
+                    fi
+                done
             fi
-            
-            if id "$username" &>/dev/null; then
-                if ask_yes_no "Remove $username from sudo group?"; then
-                    deluser "$username" sudo 2>&1 | tee -a "$LOG_FILE"
-                    log_action "Removed $username from sudo group"
-                fi
-            else
-                echo "User $username does not exist"
-            fi
-        done
-    fi
-    
-    echo -e "${GREEN}User management complete!${NC}"
+            ;;
+
+        2)
+            ###########################################################
+            # ADMIN MANAGEMENT (SUDO CONTROL)
+            ###########################################################
+            clear
+            echo -e "${GREEN}=== Administrator Management ===${NC}"
+            echo ""
+
+            echo "Current Administrators (sudo group):"
+            getent group sudo | awk -F: '{print $4}'
+            echo ""
+
+            echo "1) Add user to sudo (make admin)"
+            echo "2) Remove user from sudo"
+            echo "3) Return"
+            echo ""
+
+            read -p "Select an option: " admin_choice
+
+            case $admin_choice in
+                1)
+                    read -p "Enter username to make administrator: " username
+                    if id "$username" &>/dev/null; then
+                        usermod -aG sudo "$username"
+                        log_action "Added $username to sudo group"
+                        echo -e "${GREEN}$username is now an administrator.${NC}"
+                    else
+                        echo -e "${RED}User does not exist.${NC}"
+                    fi
+                    ;;
+                2)
+                    read -p "Enter username to remove from administrators: " username
+                    if id "$username" &>/dev/null; then
+                        deluser "$username" sudo
+                        log_action "Removed $username from sudo group"
+                        echo -e "${GREEN}$username is no longer an administrator.${NC}"
+                    else
+                        echo -e "${RED}User does not exist.${NC}"
+                    fi
+                    ;;
+                *)
+                    echo "Returning..."
+                    ;;
+            esac
+            ;;
+
+        3)
+            return
+            ;;
+        *)
+            echo -e "${RED}Invalid option.${NC}"
+            ;;
+    esac
+
     pause
 }
 
